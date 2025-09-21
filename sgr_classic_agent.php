@@ -1,3 +1,32 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Single-file bootstrapper for the SGR Classic research agent.
+ *
+ * Usage:
+ *   php sgr_classic_agent.php
+ *
+ * Optional environment variables:
+ *   - SGR_PYTHON: path to the python interpreter (defaults to 'python3').
+ *
+ * All command-line arguments are forwarded to the underlying Python agent.
+ */
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "This script must be run from the command line.\n");
+    exit(1);
+}
+
+$args = $argv;
+array_shift($args);
+if (in_array('--help', $args, true) || in_array('-h', $args, true)) {
+    fwrite(STDOUT, "Usage: php sgr_classic_agent.php [arguments]\n");
+    fwrite(STDOUT, "Set SGR_PYTHON to choose a python interpreter.\n");
+    exit(0);
+}
+
+$pythonCode = <<<'PYTHON'
 #!/usr/bin/env python3
 """
 SGR Research Agent - Schema-Guided Reasoning with Adaptive Planning
@@ -24,8 +53,11 @@ from openai import OpenAI
 from tavily import TavilyClient
 from rich.console import Console
 from rich.panel import Panel
+import re
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.formatters import TextFormatter
+import trafilatura
 
-from scraping import fetch_page_content
 
 # =============================================================================
 # CONFIGURATION
@@ -83,6 +115,109 @@ def load_config():
     return config
 
 CONFIG = load_config()
+
+
+# =============================================================================
+# SCRAPING UTILITIES
+# =============================================================================
+
+def extract_youtube_id(url: str) -> Optional[str]:
+    """Extract YouTube video ID from URL, return None if not YouTube"""
+    youtube_patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|m\.youtube\.com/watch\?v=)([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/v/([a-zA-Z0-9_-]{11})',
+    ]
+
+    for pattern in youtube_patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)  # Return video ID
+
+    return None  # Not a YouTube URL
+
+def fetch_youtube_transcript(url: str) -> dict:
+    """Fetch YouTube transcript by video ID"""
+    try:
+        video_id = extract_youtube_id(url)
+        if not video_id:
+            return {'url': url, 'status': 'error', 'error': 'Invalid YouTube URL'}
+
+        transcript_list = YouTubeTranscriptApi().list(video_id)
+        original_transcript = None
+        first_transcript = next(iter(transcript_list), None)
+        if first_transcript is None:
+            return {'url': url, 'status': 'error', 'error': 'No transcript found'}
+
+        for transcript in transcript_list:
+            if not transcript.is_generated:
+                original_transcript = transcript
+                break
+        if not original_transcript:
+            original_transcript = transcript_list.find_transcript([first_transcript.language_code])
+
+        transcript_data = original_transcript.fetch()
+        formatter = TextFormatter()
+        transcript_text = formatter.format_transcript(transcript_data)
+
+        if transcript_text and len(transcript_text.strip()) > 100:  # Ensure meaningful content
+            return {
+                'url': url,
+                'full_content': transcript_text.strip(),
+                'status': 'success',
+                'char_count': len(transcript_text)
+            }
+
+        return {'url': url, 'status': 'empty', 'error': 'No meaningful transcript found'}
+
+    except Exception as e:
+        return {
+            'url': url,
+            'status': 'error',
+            'error': f"YouTube transcript: {str(e)[:200]}"
+        }
+
+def fetch_page_content(url: str) -> dict:
+    """Fetch content using appropriate method (YouTube transcript or web scraping)"""
+
+    video_id = extract_youtube_id(url)
+    if video_id:
+        # YouTube video - get transcript
+        return fetch_youtube_transcript(url)
+
+    # Regular websites - use trafilatura
+    try:
+        # Fetch with trafilatura defaults
+        downloaded = trafilatura.fetch_url(url)
+        if downloaded:
+            # Extract with Markdown formatting and readability algorithm
+            content = trafilatura.extract(
+                downloaded,
+                output_format='markdown',
+                favor_precision=True,
+                include_tables=True,
+                include_links=False,
+                include_images=False,
+                deduplicate=True,
+                target_language=None   # Auto-detect language
+            )
+            if content and len(content.strip()) > 100:  # Ensure meaningful content
+                return {
+                    'url': url,
+                    'full_content': content.strip(),
+                    'status': 'success',
+                    'char_count': len(content)
+                }
+
+        return {'url': url, 'status': 'empty', 'error': 'No meaningful content extracted'}
+
+    except Exception as e:
+        return {
+            'url': url,
+            'status': 'error',
+            'error': str(e)[:200]  # Limit error message length
+        }
+
 
 # Check required parameters
 if not CONFIG['openai_api_key']:
@@ -783,3 +918,58 @@ def main():
 
 if __name__ == "__main__":
     main()
+PYTHON;
+
+$runtimeDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'sgr_classic_agent';
+if (!is_dir($runtimeDir)) {
+    if (!mkdir($runtimeDir, 0777, true) && !is_dir($runtimeDir)) {
+        fwrite(STDERR, 'Failed to create runtime directory: ' . $runtimeDir . PHP_EOL);
+        exit(1);
+    }
+}
+
+$pythonFile = $runtimeDir . DIRECTORY_SEPARATOR . 'sgr_classic.py';
+$currentHash = sha1($pythonCode);
+$needsWrite = true;
+if (file_exists($pythonFile)) {
+    $existing = file_get_contents($pythonFile);
+    if ($existing !== false && sha1($existing) === $currentHash) {
+        $needsWrite = false;
+    }
+}
+if ($needsWrite) {
+    if (file_put_contents($pythonFile, $pythonCode) === false) {
+        fwrite(STDERR, 'Unable to write Python agent to: ' . $pythonFile . PHP_EOL);
+        exit(1);
+    }
+    @chmod($pythonFile, 0700);
+}
+
+$pythonExecutable = getenv('SGR_PYTHON');
+if ($pythonExecutable === false || $pythonExecutable === '') {
+    $pythonExecutable = 'python3';
+}
+
+$forwardArgs = '';
+if (!empty($args)) {
+    $escaped = array_map('escapeshellarg', $args);
+    $forwardArgs = ' ' . implode(' ', $escaped);
+}
+
+$command = escapeshellarg($pythonExecutable) . ' ' . escapeshellarg($pythonFile) . $forwardArgs;
+
+$descriptorspec = [
+    0 => STDIN,
+    1 => STDOUT,
+    2 => STDERR,
+];
+
+$process = proc_open($command, $descriptorspec, $pipes, getcwd());
+if (!is_resource($process)) {
+    fwrite(STDERR, 'Failed to launch Python process.' . PHP_EOL);
+    exit(1);
+}
+
+$status = proc_close($process);
+exit($status);
+

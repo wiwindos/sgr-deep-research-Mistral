@@ -1,55 +1,47 @@
-# SGR Research Agent - Configuration Template
-# Production-ready configuration for Schema-Guided Reasoning
-# Скопируйте этот файл в config.yaml и заполните своими API ключами
+# SGR Classic Agent (single-file edition) - Configuration Template
+# Copy this file to config.yaml and fill in your API keys before running the agent.
+#
+# Runtime dependencies (install once):
+#   pip install openai tavily-python pydantic annotated-types rich trafilatura \
+#              youtube-transcript-api PyYAML
+#
+# Launch instructions:
+#   php sgr_classic_agent.php
+#   # Optional: choose interpreter → SGR_PYTHON=/path/to/python php sgr_classic_agent.php
+#
+# The PHP wrapper extracts an embedded Python version of the classic agent to a
+# temporary directory and executes it. All configuration values below can also be
+# provided via environment variables (see comments).
 
 # OpenAI Configuration
 openai:
-  api_key: "your-openai-api-key-here"  # Обязательно: Ваш OpenAI API ключ
-  base_url: ""                         # Опционально: Альтернативный URL (например, для прокси)
-  model: "gpt-4o-mini"                 # Модель для использования
-  max_tokens: 8000                     # Максимальное количество токенов
-  temperature: 0.4                     # Температура генерации (0.0-1.0)
+  api_key: "your-openai-api-key-here"  # Required. Env override: OPENAI_API_KEY
+  base_url: ""                         # Optional custom endpoint. Env: OPENAI_BASE_URL
+  model: "gpt-4o-mini"                 # Env: OPENAI_MODEL
+  max_tokens: 8000                     # Env: MAX_TOKENS
+  temperature: 0.4                     # Env: TEMPERATURE
 
 # Tavily Search Configuration
 tavily:
-  api_key: "your-tavily-api-key-here"  # Обязательно: Ваш Tavily API ключ
+  api_key: "your-tavily-api-key-here"  # Required. Env override: TAVILY_API_KEY
 
 # Search Settings
 search:
-  max_results: 10                      # Максимальное количество результатов поиска
+  max_results: 10                      # Env override: MAX_SEARCH_RESULTS
 
 # Scraping Settings
 scraping:
-  enabled: false                       # Включить скрейпинг полного текста найденных страниц
-  max_pages: 5                         # Максимум страниц для скрейпинга за поиск
-  content_limit: 1500                  # Лимит символов полного контента на источник
+  enabled: false                       # Env: SCRAPING_ENABLED=true to enable full-page fetch
+  max_pages: 5                         # Env: SCRAPING_MAX_PAGES
+  content_limit: 1500                  # Env: SCRAPING_CONTENT_LIMIT
 
 # Execution Settings
 execution:
-  max_steps: 6                         # Максимальное количество шагов выполнения
-  reports_dir: "reports"               # Директория для сохранения отчетов
+  max_steps: 6                         # Env: MAX_EXECUTION_STEPS
+  reports_dir: "reports"               # Env: REPORTS_DIRECTORY
 
-
-
-# ============================================================================
-# ИНСТРУКЦИИ ПО НАСТРОЙКЕ:
-# ============================================================================
-#
-# 1. Получите OpenAI API ключ:
-#    - Зайдите на https://platform.openai.com/api-keys
-#    - Создайте новый API ключ
-#    - Скопируйте его в поле openai.api_key
-#
-# 2. Получите Tavily API ключ:
-#    - Зайдите на https://tavily.com
-#    - Зарегистрируйтесь и получите API ключ
-#    - Скопируйте его в поле tavily.api_key
-#
-# 3. Альтернативно, можете использовать переменные окружения:
-#    export OPENAI_API_KEY="your-openai-key"
-#    export TAVILY_API_KEY="your-tavily-key"
-#
-# 4. Создайте директорию для отчетов:
-#    mkdir reports
-#
-# ============================================================================
+# Additional tips:
+# - Create the reports directory before running: mkdir -p reports
+# - To avoid storing config.yaml in git, keep credentials only in your local copy.
+# - You can run the agent non-interactively by passing arguments that the Python
+#   script understands (all CLI args after the PHP wrapper are forwarded).
