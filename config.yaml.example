@@ -1,6 +1,12 @@
 # SGR Research Agent - Configuration Template
 # Production-ready configuration for Schema-Guided Reasoning
 # Скопируйте этот файл в config.yaml и заполните своими API ключами
+#
+# Быстрый старт:
+# 1. Установите зависимости: pip install openai tavily youtube-transcript-api trafilatura rich pydantic annotated-types PyYAML
+# 2. Скопируйте этот файл: cp config.yaml.example config.yaml
+# 3. Заполните API ключи ниже или задайте переменные окружения OPENAI_API_KEY / TAVILY_API_KEY
+# 4. Запустите агента: python sgr_classic_agent.py
 
 # OpenAI Configuration
 openai:
