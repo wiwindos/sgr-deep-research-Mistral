@@ -1,52 +1,59 @@
-# SGR Research Agent - Configuration Template
+# SGR Research Agent - Configuration Template (Mistral)
 # Production-ready configuration for Schema-Guided Reasoning
 # Скопируйте этот файл в config.yaml и заполните своими API ключами
+#
+# Быстрый старт:
+# 1) pip install mistralai tavily-python youtube-transcript-api trafilatura rich pydantic annotated-types PyYAML
+# 2) cp config.yaml.example config.yaml
+# 3) Заполните API ключи ниже или задайте MISTRAL_API_KEY / TAVILY_API_KEY
+# 4) python sgr_classic_agent.py
 
-# OpenAI Configuration
-openai:
-  api_key: "your-openai-api-key-here"  # Обязательно: Ваш OpenAI API ключ
-  base_url: ""                         # Опционально: Альтернативный URL (например, для прокси)
-  model: "gpt-4o-mini"                 # Модель для использования
-  max_tokens: 8000                     # Максимальное количество токенов
-  temperature: 0.4                     # Температура генерации (0.0-1.0)
+# Mistral Configuration
+mistral:
+  api_key: "token"   # Обязательно: Ваш Mistral API ключ
+  base_url: ""                           # Опционально: альтернативный URL (например, прокси)
+  model: "mistral-large-latest"          # Модель для использования
+  max_tokens: 8000                       # Максимальное количество токенов
+  temperature: 0.4                       # Температура генерации (0.0-1.0)
 
 # Tavily Search Configuration
 tavily:
-  api_key: "your-tavily-api-key-here"  # Обязательно: Ваш Tavily API ключ
+  api_key: "token"    # Обязательно: Ваш Tavily API ключ
 
 # Search Settings
 search:
-  max_results: 10                      # Максимальное количество результатов поиска
+  max_results: 10                        # Максимальное количество результатов поиска
 
 # Scraping Settings
 scraping:
-  enabled: false                       # Включить скрейпинг полного текста найденных страниц
-  max_pages: 5                         # Максимум страниц для скрейпинга за поиск
-  content_limit: 1500                  # Лимит символов полного контента на источник
+  enabled: false                         # Включить скрейпинг полного текста найденных страниц
+  max_pages: 5                           # Максимум страниц для скрейпинга за поиск
+  content_limit: 1500                    # Лимит символов полного контента на источник
 
 # Execution Settings
 execution:
-  max_steps: 6                         # Максимальное количество шагов выполнения
-  reports_dir: "reports"               # Директория для сохранения отчетов
-
+  max_steps: 6                           # Максимальное количество шагов выполнения
+  reports_dir: "reports"                 # Директория для сохранения отчетов
 
 
 # ============================================================================
 # ИНСТРУКЦИИ ПО НАСТРОЙКЕ:
 # ============================================================================
 #
-# 1. Получите OpenAI API ключ:
-#    - Зайдите на https://platform.openai.com/api-keys
-#    - Создайте новый API ключ
-#    - Скопируйте его в поле openai.api_key
+# 1. Получите Mistral API ключ:
+#    - https://console.mistral.ai/
+#    - Создайте API ключ и вставьте в mistral.api_key
 #
 # 2. Получите Tavily API ключ:
-#    - Зайдите на https://tavily.com
-#    - Зарегистрируйтесь и получите API ключ
-#    - Скопируйте его в поле tavily.api_key
+#    - https://tavily.com
+#    - Вставьте в tavily.api_key
 #
-# 3. Альтернативно, можете использовать переменные окружения:
-#    export OPENAI_API_KEY="your-openai-key"
+# 3. Переменные окружения (альтернатива файлу):
+#    export MISTRAL_API_KEY="your-mistral-key"
+#    export MISTRAL_BASE_URL=""
+#    export MISTRAL_MODEL="mistral-large-latest"
+#    export MAX_TOKENS=8000
+#    export TEMPERATURE=0.4
 #    export TAVILY_API_KEY="your-tavily-key"
 #
 # 4. Создайте директорию для отчетов:
