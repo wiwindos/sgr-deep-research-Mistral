@@ -2,26 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 SGR Research Agent - Schema-Guided Reasoning with Adaptive Planning (Mistral)
-Clean JSON-Schema-only implementation for Mistral with schema compatibility layer.
+JSON-Schema-only + ПОЛНОЦЕННЫЕ ЛОГИ и артефакты.
 
-Изменения:
-- Полностью удалён OpenAI, заменён на Mistral (`mistralai`).
-- Строго один путь вывода: JSON Schema с трансформациями под Mistrал:
-  * additionalProperties:false для всех object
-  * anyOf → oneOf (особенно важно для поля union `function`)
-  * inline $ref из $defs
-  * удаление проблемных array-ключей: minItems/maxItems/uniqueItems/contains/minContains/maxContains
-- Сообщения очищаются для Mistral (никаких tool_calls).
-- Дальше локальная Pydantic-валидация результата.
-- FIX: после Clarification — немедленный выход (REPL спрашивает ответы).
-- FIX: никаких `system` после старта диалога — только один `system` в самом начале.
+Фиксы:
+- Ранний выход после Clarification.
+- Никаких `system` после старта диалога — только один system в самом начале.
+- Жёсткая нормализация ролей в clean_messages_for_mistral.
+- ЛОГИ: файл с ротацией + консоль, артефакты каждого запроса к Mistral.
 """
 
 import json
 import os
 import re
 import yaml
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from itertools import count
 from typing import List, Union, Literal, Optional, Dict, Any, Tuple
 
 try:
@@ -34,6 +31,12 @@ from annotated_types import MinLen, MaxLen
 from tavily import TavilyClient
 from rich.console import Console
 from rich.panel import Panel
+try:
+    from rich.logging import RichHandler
+    _HAVE_RICH_HANDLER = True
+except Exception:
+    _HAVE_RICH_HANDLER = False
+
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.formatters import TextFormatter
 import trafilatura
@@ -51,8 +54,10 @@ def load_config() -> Dict[str, Any]:
         'mistral_model': os.getenv('MISTRAL_MODEL', 'mistral-large-latest'),
         'max_tokens': int(os.getenv('MAX_TOKENS', '8000')),
         'temperature': float(os.getenv('TEMPERATURE', '0.4')),
+
         # Tavily
         'tavily_api_key': os.getenv('TAVILY_API_KEY', ''),
+
         # Search/scraping/execution
         'max_search_results': int(os.getenv('MAX_SEARCH_RESULTS', '10')),
         'max_execution_steps': int(os.getenv('MAX_EXECUTION_STEPS', '6')),
@@ -60,11 +65,17 @@ def load_config() -> Dict[str, Any]:
         'scraping_enabled': os.getenv('SCRAPING_ENABLED', 'false').lower() == 'true',
         'scraping_max_pages': int(os.getenv('SCRAPING_MAX_PAGES', '5')),
         'scraping_content_limit': int(os.getenv('SCRAPING_CONTENT_LIMIT', '1500')),
+
+        # Logging & Debug
+        'log_dir': os.getenv('LOG_DIR', 'logs'),
+        'log_file': os.getenv('LOG_FILE', 'agent.log'),
+        'log_level': os.getenv('LOG_LEVEL', 'INFO'),   # DEBUG/INFO/WARN/ERROR
+        'debug_dir': os.getenv('DEBUG_DIR', 'debug_out'),
     }
 
-    if os.path.exists('config.yaml.example'):
+    if os.path.exists('config.yaml'):
         try:
-            with open('config.yaml.example', 'r', encoding='utf-8') as f:
+            with open('config.yaml', 'r', encoding='utf-8') as f:
                 yaml_config = yaml.safe_load(f) or {}
 
             if 'mistral' in yaml_config:
@@ -91,6 +102,14 @@ def load_config() -> Dict[str, Any]:
                 ex = yaml_config['execution'] or {}
                 config['max_execution_steps'] = ex.get('max_steps', config['max_execution_steps'])
                 config['reports_directory'] = ex.get('reports_dir', config['reports_directory'])
+
+            if 'logging' in yaml_config:
+                lg = yaml_config['logging'] or {}
+                config['log_dir'] = lg.get('dir', config['log_dir'])
+                config['log_file'] = lg.get('file', config['log_file'])
+                config['log_level'] = lg.get('level', config['log_level'])
+                config['debug_dir'] = lg.get('debug_dir', config['debug_dir'])
+
         except Exception as e:
             print(f"[yellow]Warning: Could not load config.yaml: {e}[/yellow]")
 
@@ -98,7 +117,7 @@ def load_config() -> Dict[str, Any]:
 
 CONFIG = load_config()
 
-# Required keys
+# Ensure required keys
 if not CONFIG['mistral_api_key']:
     print("[red]ERROR:[/red] MISTRAL_API_KEY not set in config.yaml or environment")
     raise SystemExit(1)
@@ -107,8 +126,68 @@ if not CONFIG['tavily_api_key']:
     raise SystemExit(1)
 
 # =============================================================================
+# LOGGING SETUP
+# =============================================================================
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+ensure_dir(CONFIG['log_dir'])
+ensure_dir(CONFIG['debug_dir'])
+
+LOG_PATH = os.path.join(CONFIG['log_dir'], CONFIG['log_file'])
+
+logger = logging.getLogger("sgr")
+logger.setLevel(getattr(logging, CONFIG['log_level'].upper(), logging.INFO))
+logger.propagate = False
+# Clear existing handlers to avoid duplicate logs in REPL runs
+for h in list(logger.handlers):
+    logger.removeHandler(h)
+
+# File handler with rotation
+file_handler = RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8')
+file_fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+file_handler.setFormatter(file_fmt)
+file_handler.setLevel(getattr(logging, CONFIG['log_level'].upper(), logging.INFO))
+logger.addHandler(file_handler)
+
+# Console handler
+if _HAVE_RICH_HANDLER:
+    console_handler = RichHandler(rich_tracebacks=False, show_path=False, markup=True)
+    console_handler.setLevel(getattr(logging, CONFIG['log_level'].upper(), logging.INFO))
+    logger.addHandler(console_handler)
+else:
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    ch.setLevel(getattr(logging, CONFIG['log_level'].upper(), logging.INFO))
+    logger.addHandler(ch)
+
+# =============================================================================
+# ARTIFACT HELPERS
+# =============================================================================
+
+def dump_json(path: str, data: Any):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("Failed to write JSON artifact %s: %s", path, e)
+
+def dump_text(path: str, text: str):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text or "")
+    except Exception as e:
+        logger.exception("Failed to write text artifact %s: %s", path, e)
+
+REQ_COUNTER = count(1)
+
+# =============================================================================
 # SCRAPING UTILITIES - Embedded
 # =============================================================================
+
+console = Console()
+print = console.print  # красивый вывод
 
 def extract_youtube_id(url: str) -> Optional[str]:
     youtube_patterns = [
@@ -146,6 +225,7 @@ def fetch_youtube_transcript(url: str) -> dict:
             return {'url': url, 'full_content': text.strip(), 'status': 'success', 'char_count': len(text)}
         return {'url': url, 'status': 'empty', 'error': 'No meaningful transcript found'}
     except Exception as e:
+        logger.exception("YouTube transcript error: %s", e)
         return {'url': url, 'status': 'error', 'error': f"YouTube transcript: {str(e)[:200]}"}
 
 def fetch_page_content(url: str) -> dict:
@@ -169,10 +249,11 @@ def fetch_page_content(url: str) -> dict:
                 return {'url': url, 'full_content': content.strip(), 'status': 'success', 'char_count': len(content)}
         return {'url': url, 'status': 'empty', 'error': 'No meaningful content extracted'}
     except Exception as e:
+        logger.exception("Scraping error: %s", e)
         return {'url': url, 'status': 'error', 'error': str(e)[:200]}
 
 # =============================================================================
-# SGR SCHEMAS - Core Schema-Guided Reasoning Definitions (Pydantic unchanged)
+# SGR SCHEMAS
 # =============================================================================
 
 class Clarification(BaseModel):
@@ -261,7 +342,7 @@ class NextStep(BaseModel):
     )
 
 # =============================================================================
-# JSON SCHEMA COMPAT LAYER (Pydantic → Mistral-friendly JSON Schema)
+# JSON SCHEMA COMPAT LAYER
 # =============================================================================
 
 UNSUPPORTED_ARRAY_KEYWORDS = {
@@ -386,7 +467,7 @@ def build_mistral_compatible_schema(pydantic_model: type[BaseModel],
     return s3, debug
 
 # =============================================================================
-# PROMPTS - System Instructions
+# PROMPTS
 # =============================================================================
 
 def guardrail_message() -> str:
@@ -427,15 +508,12 @@ ANTI-CYCLING: max 1 clarification; max 3–4 searches before report.
 # INITIALIZATION
 # =============================================================================
 
-console = Console()
-print = console.print
-
 # Mistral client (lazy import with friendly error)
 def create_mistral_client():
     try:
         from mistralai import Mistral
     except Exception:
-        print("[red]ERROR:[/red] 'mistralai' is not installed. Run: pip install mistralai")
+        logger.error("'mistralai' is not installed. Run: pip install mistralai")
         raise
     kwargs: Dict[str, Any] = {"api_key": CONFIG['mistral_api_key']}
     if CONFIG['mistral_base_url']:
@@ -529,6 +607,7 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
             for a in cmd.assumptions:
                 print(f"   • {a}")
         print(f"\n[bold yellow]⏸️  Research paused - please answer questions above[/bold yellow]")
+        logger.info("Clarification requested: %s", cmd.questions)
         return {"tool": "clarification", "questions": cmd.questions, "status": "waiting_for_user"}
 
     elif isinstance(cmd, GeneratePlan):
@@ -543,6 +622,7 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
         print(f"🎯 Goal: {cmd.research_goal}")
         for i, step in enumerate(cmd.planned_steps, 1):
             print(f"   {i}. {step}")
+        logger.info("Plan created: %s", plan)
         return plan
 
     elif isinstance(cmd, WebSearch):
@@ -592,10 +672,12 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
                 ok = len([c for c in scraped_content.values() if c['status'] == 'success'])
                 print(f"📄 Scraped: {ok}/{len(scraped_content)} pages")
 
+            logger.info("WebSearch done: %s", {"query": cmd.query, "sources": len(citation_numbers)})
             return search_result
 
         except Exception as e:
             msg = f"Search error: {str(e)}"
+            logger.exception("WebSearch failed: %s", e)
             print(f"❌ {msg}")
             return {"error": msg}
 
@@ -611,6 +693,7 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
         for change in cmd.plan_changes:
             print(f"   • [yellow]{change}[/yellow]")
         print(f"🎯 [bold green]New goal:[/bold green] {cmd.new_goal}")
+        logger.info("Plan adapted: %s", {"new_goal": cmd.new_goal, "changes": cmd.plan_changes})
         return {"tool": "adapt_plan", "original_goal": cmd.original_goal, "new_goal": cmd.new_goal, "changes": cmd.plan_changes}
 
     elif isinstance(cmd, CreateReport):
@@ -630,8 +713,12 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
         full += cmd.content
         full += format_sources()
 
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(full)
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(full)
+        except Exception as e:
+            logger.exception("Failed to save report: %s", e)
+            raise
 
         report = {
             "title": cmd.title,
@@ -642,6 +729,7 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
             "filepath": filepath,
             "timestamp": datetime.now().isoformat()
         }
+        logger.info("Report saved: %s", filepath)
         print(f"📄 [bold blue]Report Saved:[/bold blue] {filepath}")
         return report
 
@@ -652,19 +740,23 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
             print(f"📝 [bold]Completed steps:[/bold]")
             for step in cmd.completed_steps:
                 print(f"   • {step}")
+        logger.info("Completion: %s", {"status": cmd.status, "steps": cmd.completed_steps})
         return {"tool": "report_completion", "status": cmd.status, "completed_steps": cmd.completed_steps}
 
     else:
+        logger.warning("Unknown command: %s", type(cmd))
         return f"Unknown command: {type(cmd)}"
 
 # =============================================================================
 # MISTRAL JSON-SCHEMA CALL
 # =============================================================================
 
-# Build compatible schema once
+# Build compatible schema once, save artifacts
 NEXTSTEP_JSON_SCHEMA, _SCHEMA_DEBUG = build_mistral_compatible_schema(
     NextStep, loosen_arrays=True, inline_refs=True
 )
+dump_json(os.path.join(CONFIG['debug_dir'], "nextstep_schema.json"), NEXTSTEP_JSON_SCHEMA)
+dump_json(os.path.join(CONFIG['debug_dir'], "nextstep_schema_transform.json"), _SCHEMA_DEBUG)
 
 def mistral_complete_json_schema(messages: List[Dict[str, Any]]) -> NextStep:
     """Call Mistral with JSON-Schema response_format and validate via Pydantic."""
@@ -677,6 +769,12 @@ def mistral_complete_json_schema(messages: List[Dict[str, Any]]) -> NextStep:
         },
     }
     cleaned = clean_messages_for_mistral(messages)
+    rid = next(REQ_COUNTER)
+
+    # Сохраним отправляемые messages перед запросом
+    dump_json(os.path.join(CONFIG['debug_dir'], f"req_{rid:04d}_messages.json"), cleaned)
+
+    logger.debug("Mistral request %s | model=%s | msgs=%d", rid, CONFIG['mistral_model'], len(cleaned))
     resp = mistral_client.chat.complete(
         model=CONFIG['mistral_model'],
         messages=cleaned,
@@ -684,8 +782,15 @@ def mistral_complete_json_schema(messages: List[Dict[str, Any]]) -> NextStep:
         max_tokens=CONFIG['max_tokens'],
         temperature=CONFIG['temperature'],
     )
+
     raw = resp.choices[0].message.content or ""
-    return NextStep.model_validate_json(raw)
+    dump_text(os.path.join(CONFIG['debug_dir'], f"req_{rid:04d}_raw.txt"), raw)
+
+    parsed = NextStep.model_validate_json(raw)
+    dump_json(os.path.join(CONFIG['debug_dir'], f"req_{rid:04d}_parsed.json"), parsed.model_dump())
+
+    logger.debug("Mistral response %s parsed OK", rid)
+    return parsed
 
 # =============================================================================
 # MAIN EXECUTION ENGINE
@@ -702,6 +807,8 @@ def execute_research_task(task: str) -> str:
     print(f"[dim]🔗 Base URL: {CONFIG['mistral_base_url'] or 'default'}[/dim]")
     print(f"[dim]🔑 API Key: {'✓ Configured' if CONFIG['mistral_api_key'] else '✗ Missing'}[/dim]")
     print(f"[dim]📊 Max tokens: {CONFIG['max_tokens']}, Temperature: {CONFIG['temperature']}[/dim]")
+
+    logger.info("Session start | model=%s | task=%s", CONFIG['mistral_model'], task)
 
     # Ровно один начальный system: guardrails + system_prompt
     log: List[Dict[str, Any]] = [
@@ -732,28 +839,33 @@ def execute_research_task(task: str) -> str:
         if context_msg:
             ctx = "\n".join(context_msg)
             log.append({"role": "user", "content": ctx})  # ВАЖНО: user, не system
-            print(f"[dim]🔧 Context: {ctx[:150]}...[/dim]")
+            logger.debug("Context injected: %s", ctx[:300])
 
         try:
             job = mistral_complete_json_schema(log)
-            # Debug
+            # Debug to console & file
             print(f"🤖 [bold magenta]LLM RESPONSE[/bold magenta]")
             print(f"   🧠 Reasoning Steps: {job.reasoning_steps}")
             print(f"   🔍 Searches Done: {job.searches_done}  ✅ Enough Data: {job.enough_data}")
             print(f"   📝 Remaining Steps: {job.remaining_steps}  🏁 Task Completed: {job.task_completed}")
             print(f"   🔧 Tool: {job.function.tool}")
+            logger.info("LLM step ok | tool=%s | remaining=%s | done=%s",
+                        job.function.tool, job.remaining_steps, job.task_completed)
         except Exception as e:
+            logger.exception("Mistral/Validation error at %s: %s", step_id, e)
             print(f"[bold red]❌ Mistral/Validation error:[/bold red] {e}")
             break
 
         # Ранний выход на Clarification, чтобы REPL спросил пользователя
         if isinstance(job.function, Clarification):
             dispatch(job.function, CONTEXT)
+            logger.info("Awaiting clarification from user")
             return "CLARIFICATION_NEEDED"
 
         if job.task_completed or isinstance(job.function, ReportCompletion):
             print(f"[bold green]✅ Task completed[/bold green]")
             dispatch(job.function, CONTEXT)
+            logger.info("Task completed by model")
             break
 
         # assistant сводка шага
@@ -787,13 +899,16 @@ def execute_research_task(task: str) -> str:
                 ok = len([c for c in scraped.values() if c['status'] == 'success'])
                 formatted += f"Scraping Summary: {ok}/{len(scraped)} pages successfully scraped\n"
             log.append({"role": "user", "content": formatted})
+            logger.debug("Fed back WebSearch results to the model")
         else:
             result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             log.append({"role": "user", "content": f"TOOL RESULT ({job.function.tool}): {result_text}"})
+            logger.debug("Fed back tool result (%s) to the model", job.function.tool)
 
         # Автозавершение после отчёта
         if isinstance(job.function, CreateReport):
             print(f"\n✅ [bold green]Auto-completing after report creation[/bold green]")
+            logger.info("Auto-complete after CreateReport")
             break
 
     return "COMPLETED"
@@ -804,7 +919,7 @@ def execute_research_task(task: str) -> str:
 
 def main():
     print("[bold]🧠 SGR Research Agent (Mistral, JSON-Schema only)[/bold]")
-    print("Schema-Guided Reasoning with plan adaptation and strict JSON Schema I/O")
+    print("Schema-Guided Reasoning with plan adaptation, strict JSON Schema I/O, and robust logging")
     print()
     print("Core features:")
     print("  🤔 Clarification-first approach")
@@ -856,11 +971,14 @@ def main():
             sources_count = len(CONTEXT.get("sources", {}))
             print(f"\n📊 Session stats: 🔍 {searches_count} searches, 📎 {sources_count} sources")
             print(f"📁 Reports saved to: ./{CONFIG['reports_directory']}/")
+            logger.info("Session end | searches=%d | sources=%d", searches_count, sources_count)
 
         except KeyboardInterrupt:
             print("\n👋 Interrupted by user.")
+            logger.info("Interrupted by user")
             break
         except Exception as e:
+            logger.exception("Fatal error in main loop: %s", e)
             print(f"❌ Error: {e}")
             continue
 
