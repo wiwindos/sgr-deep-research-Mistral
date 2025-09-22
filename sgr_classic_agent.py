@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-SGR Research Agent - Schema-Guided Reasoning with Adaptive Planning
-Clean implementation following SGR principles with clarification-first approach
+SGR Research Agent - Schema-Guided Reasoning with Adaptive Planning (Mistral)
+Clean JSON-Schema-only implementation for Mistral with schema compatibility layer.
 
-🧠 Adaptive planning meets structured reasoning in perfect harmony
-📎 Automatic citation management for academic excellence
-🌍 Multi-language support with LLM-based detection
-🔬 Production-ready research automation system
+Изменения:
+- Полностью удалён OpenAI, заменён на Mistral (`mistralai`).
+- Строго один путь вывода: JSON Schema с трансформациями под Mistrал:
+  * additionalProperties:false для всех object
+  * anyOf → oneOf (особенно важно для поля union `function`)
+  * inline $ref из $defs
+  * удаление проблемных array-ключей: minItems/maxItems/uniqueItems/contains/minContains/maxContains
+- Сообщения очищаются для Mistral (никаких tool_calls).
+- Дальше локальная Pydantic-валидация результата.
+- FIX: после Clarification — немедленный выход (REPL спрашивает ответы).
+- FIX: никаких `system` после старта диалога — только один `system` в самом начале.
 """
 
 import json
@@ -14,14 +22,15 @@ import os
 import re
 import yaml
 from datetime import datetime
-from typing import List, Union, Literal, Optional, Dict, Any
+from typing import List, Union, Literal, Optional, Dict, Any, Tuple
+
 try:
     from typing import Annotated  # Python 3.9+
 except ImportError:
-    from typing_extensions import Annotated  # Python 3.8
+    from typing_extensions import Annotated  # Python 3.8+
+
 from pydantic import BaseModel, Field
 from annotated_types import MinLen, MaxLen
-from openai import OpenAI
 from tavily import TavilyClient
 from rich.console import Console
 from rich.panel import Panel
@@ -33,15 +42,18 @@ import trafilatura
 # CONFIGURATION
 # =============================================================================
 
-def load_config():
-    """Load configuration from config.yaml and environment variables"""
+def load_config() -> Dict[str, Any]:
+    """Load configuration from config.yaml and environment variables (Mistral only)."""
     config = {
-        'openai_api_key': os.getenv('OPENAI_API_KEY', ''),
-        'openai_base_url': os.getenv('OPENAI_BASE_URL', ''),
-        'openai_model': os.getenv('OPENAI_MODEL', 'gpt-4o-mini'),
+        # Mistral
+        'mistral_api_key': os.getenv('MISTRAL_API_KEY', ''),
+        'mistral_base_url': os.getenv('MISTRAL_BASE_URL', ''),
+        'mistral_model': os.getenv('MISTRAL_MODEL', 'mistral-large-latest'),
         'max_tokens': int(os.getenv('MAX_TOKENS', '8000')),
         'temperature': float(os.getenv('TEMPERATURE', '0.4')),
+        # Tavily
         'tavily_api_key': os.getenv('TAVILY_API_KEY', ''),
+        # Search/scraping/execution
         'max_search_results': int(os.getenv('MAX_SEARCH_RESULTS', '10')),
         'max_execution_steps': int(os.getenv('MAX_EXECUTION_STEPS', '6')),
         'reports_directory': os.getenv('REPORTS_DIRECTORY', 'reports'),
@@ -50,120 +62,96 @@ def load_config():
         'scraping_content_limit': int(os.getenv('SCRAPING_CONTENT_LIMIT', '1500')),
     }
 
-    if os.path.exists('config.yaml'):
+    if os.path.exists('config.yaml.example'):
         try:
-            with open('config.yaml', 'r', encoding='utf-8') as f:
-                yaml_config = yaml.safe_load(f)
+            with open('config.yaml.example', 'r', encoding='utf-8') as f:
+                yaml_config = yaml.safe_load(f) or {}
 
-            if yaml_config:
-                if 'openai' in yaml_config:
-                    openai_cfg = yaml_config['openai']
-                    config['openai_api_key'] = openai_cfg.get('api_key', config['openai_api_key'])
-                    config['openai_base_url'] = openai_cfg.get('base_url', config['openai_base_url'])
-                    config['openai_model'] = openai_cfg.get('model', config['openai_model'])
-                    config['max_tokens'] = openai_cfg.get('max_tokens', config['max_tokens'])
-                    config['temperature'] = openai_cfg.get('temperature', config['temperature'])
+            if 'mistral' in yaml_config:
+                m = yaml_config['mistral'] or {}
+                config['mistral_api_key'] = m.get('api_key', config['mistral_api_key'])
+                config['mistral_base_url'] = m.get('base_url', config['mistral_base_url'])
+                config['mistral_model'] = m.get('model', config['mistral_model'])
+                config['max_tokens'] = m.get('max_tokens', config['max_tokens'])
+                config['temperature'] = m.get('temperature', config['temperature'])
 
-                if 'tavily' in yaml_config:
-                    config['tavily_api_key'] = yaml_config['tavily'].get('api_key', config['tavily_api_key'])
+            if 'tavily' in yaml_config:
+                config['tavily_api_key'] = (yaml_config['tavily'] or {}).get('api_key', config['tavily_api_key'])
 
-                if 'search' in yaml_config:
-                    config['max_search_results'] = yaml_config['search'].get('max_results', config['max_search_results'])
+            if 'search' in yaml_config:
+                config['max_search_results'] = (yaml_config['search'] or {}).get('max_results', config['max_search_results'])
 
-                if 'scraping' in yaml_config:
-                    config['scraping_enabled'] = yaml_config['scraping'].get('enabled', config['scraping_enabled'])
-                    config['scraping_max_pages'] = yaml_config['scraping'].get('max_pages', config['scraping_max_pages'])
-                    config['scraping_content_limit'] = yaml_config['scraping'].get('content_limit', config['scraping_content_limit'])
+            if 'scraping' in yaml_config:
+                sc = yaml_config['scraping'] or {}
+                config['scraping_enabled'] = sc.get('enabled', config['scraping_enabled'])
+                config['scraping_max_pages'] = sc.get('max_pages', config['scraping_max_pages'])
+                config['scraping_content_limit'] = sc.get('content_limit', config['scraping_content_limit'])
 
-                if 'execution' in yaml_config:
-                    config['max_execution_steps'] = yaml_config['execution'].get('max_steps', config['max_execution_steps'])
-                    config['reports_directory'] = yaml_config['execution'].get('reports_dir', config['reports_directory'])
-
+            if 'execution' in yaml_config:
+                ex = yaml_config['execution'] or {}
+                config['max_execution_steps'] = ex.get('max_steps', config['max_execution_steps'])
+                config['reports_directory'] = ex.get('reports_dir', config['reports_directory'])
         except Exception as e:
-            print(f"Warning: Could not load config.yaml: {e}")
+            print(f"[yellow]Warning: Could not load config.yaml: {e}[/yellow]")
 
     return config
 
 CONFIG = load_config()
 
-# Check required parameters
-if not CONFIG['openai_api_key']:
-    print("ERROR: OPENAI_API_KEY not set in config.yaml or environment")
-    exit(1)
-
+# Required keys
+if not CONFIG['mistral_api_key']:
+    print("[red]ERROR:[/red] MISTRAL_API_KEY not set in config.yaml or environment")
+    raise SystemExit(1)
 if not CONFIG['tavily_api_key']:
-    print("ERROR: TAVILY_API_KEY not set in config.yaml or environment")
-    exit(1)
+    print("[red]ERROR:[/red] TAVILY_API_KEY not set in config.yaml or environment")
+    raise SystemExit(1)
 
 # =============================================================================
-# SCRAPING UTILITIES - Embedded from scraping.py
+# SCRAPING UTILITIES - Embedded
 # =============================================================================
 
 def extract_youtube_id(url: str) -> Optional[str]:
-    """Extract YouTube video ID from URL, return None if not YouTube"""
     youtube_patterns = [
-        r'(?:youtube\\.com/watch\\?v=|youtu\\.be/|m\\.youtube\\.com/watch\\?v=)([a-zA-Z0-9_-]{11})',
-        r'youtube\\.com/embed/([a-zA-Z0-9_-]{11})',
-        r'youtube\\.com/v/([a-zA-Z0-9_-]{11})',
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|m\.youtube\.com/watch\?v=)([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+        r'youtube\.com/v/([a-zA-Z0-9_-]{11})',
     ]
-
     for pattern in youtube_patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
     return None
 
-
 def fetch_youtube_transcript(url: str) -> dict:
-    """Fetch YouTube transcript by video ID"""
     try:
-        video_id = extract_youtube_id(url)
-        if not video_id:
+        vid = extract_youtube_id(url)
+        if not vid:
             return {'url': url, 'status': 'error', 'error': 'Invalid YouTube URL'}
-
-        transcript_list = YouTubeTranscriptApi().list(video_id)
-        original_transcript = None
-        first_transcript = next(iter(transcript_list), None)
-        if first_transcript is None:
+        transcript_list = YouTubeTranscriptApi().list(vid)
+        if not transcript_list:
             return {'url': url, 'status': 'error', 'error': 'No transcript found'}
 
-        for transcript in transcript_list:
-            if not transcript.is_generated:
-                original_transcript = transcript
+        original = None
+        first = next(iter(transcript_list), None)
+        for tr in transcript_list:
+            if not tr.is_generated:
+                original = tr
                 break
-        if not original_transcript:
-            original_transcript = transcript_list.find_transcript([first_transcript.language_code])
+        if not original:
+            original = transcript_list.find_transcript([first.language_code])
 
-        transcript_data = original_transcript.fetch()
-        formatter = TextFormatter()
-        transcript_text = formatter.format_transcript(transcript_data)
-
-        if transcript_text and len(transcript_text.strip()) > 100:
-            return {
-                'url': url,
-                'full_content': transcript_text.strip(),
-                'status': 'success',
-                'char_count': len(transcript_text)
-            }
-
+        data = original.fetch()
+        text = TextFormatter().format_transcript(data)
+        if text and len(text.strip()) > 100:
+            return {'url': url, 'full_content': text.strip(), 'status': 'success', 'char_count': len(text)}
         return {'url': url, 'status': 'empty', 'error': 'No meaningful transcript found'}
-
     except Exception as e:
-        return {
-            'url': url,
-            'status': 'error',
-            'error': f"YouTube transcript: {str(e)[:200]}"
-        }
-
+        return {'url': url, 'status': 'error', 'error': f"YouTube transcript: {str(e)[:200]}"}
 
 def fetch_page_content(url: str) -> dict:
-    """Fetch content using appropriate method (YouTube transcript or web scraping)"""
-
-    video_id = extract_youtube_id(url)
-    if video_id:
+    vid = extract_youtube_id(url)
+    if vid:
         return fetch_youtube_transcript(url)
-
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
@@ -178,28 +166,16 @@ def fetch_page_content(url: str) -> dict:
                 target_language=None
             )
             if content and len(content.strip()) > 100:
-                return {
-                    'url': url,
-                    'full_content': content.strip(),
-                    'status': 'success',
-                    'char_count': len(content)
-                }
-
+                return {'url': url, 'full_content': content.strip(), 'status': 'success', 'char_count': len(content)}
         return {'url': url, 'status': 'empty', 'error': 'No meaningful content extracted'}
-
     except Exception as e:
-        return {
-            'url': url,
-            'status': 'error',
-            'error': str(e)[:200]
-        }
+        return {'url': url, 'status': 'error', 'error': str(e)[:200]}
 
 # =============================================================================
-# SGR SCHEMAS - Core Schema-Guided Reasoning Definitions
+# SGR SCHEMAS - Core Schema-Guided Reasoning Definitions (Pydantic unchanged)
 # =============================================================================
 
 class Clarification(BaseModel):
-    """Ask clarifying questions when facing ambiguous requests"""
     tool: Literal["clarification"]
     reasoning: str = Field(description="Why clarification is needed")
     unclear_terms: Annotated[List[str], MinLen(1), MaxLen(5)] = Field(description="List of unclear terms or concepts")
@@ -207,7 +183,6 @@ class Clarification(BaseModel):
     questions: Annotated[List[str], MinLen(3), MaxLen(5)] = Field(description="3-5 specific clarifying questions")
 
 class GeneratePlan(BaseModel):
-    """Generate research plan based on clear user request"""
     tool: Literal["generate_plan"]
     reasoning: str = Field(description="Justification for research approach")
     research_goal: str = Field(description="Primary research objective")
@@ -215,16 +190,17 @@ class GeneratePlan(BaseModel):
     search_strategies: Annotated[List[str], MinLen(2), MaxLen(3)] = Field(description="Information search strategies")
 
 class WebSearch(BaseModel):
-    """Search for information with credibility focus"""
     tool: Literal["web_search"]
     reasoning: str = Field(description="Why this search is needed and what to expect")
     query: str = Field(description="Search query in same language as user request")
     max_results: int = Field(default=10, description="Maximum results (1-15)")
     plan_adapted: bool = Field(default=False, description="Is this search after plan adaptation?")
-    scrape_content: bool = Field(default_factory=lambda: CONFIG.get('scraping_enabled', False), description="Fetch full page content for deeper analysis")
+    scrape_content: bool = Field(
+        default_factory=lambda: CONFIG.get('scraping_enabled', False),
+        description="Fetch full page content for deeper analysis"
+    )
 
 class AdaptPlan(BaseModel):
-    """Adapt research plan based on new findings"""
     tool: Literal["adapt_plan"]
     reasoning: str = Field(description="Why plan needs adaptation based on new data")
     original_goal: str = Field(description="Original research goal")
@@ -233,7 +209,6 @@ class AdaptPlan(BaseModel):
     next_steps: Annotated[List[str], MinLen(2), MaxLen(4)] = Field(description="Updated remaining steps")
 
 class CreateReport(BaseModel):
-    """Create comprehensive research report with citations"""
     tool: Literal["create_report"]
     reasoning: str = Field(description="Why ready to create report now")
     title: str = Field(description="Report title")
@@ -266,73 +241,168 @@ class CreateReport(BaseModel):
     confidence: Literal["high", "medium", "low"] = Field(description="Confidence in findings")
 
 class ReportCompletion(BaseModel):
-    """Complete research task"""
     tool: Literal["report_completion"]
     reasoning: str = Field(description="Why research is now complete")
     completed_steps: Annotated[List[str], MinLen(1), MaxLen(5)] = Field(description="Summary of completed steps")
     status: Literal["completed", "failed"] = Field(description="Task completion status")
 
-# =============================================================================
-# MAIN SGR SCHEMA - Adaptive Reasoning Core
-# =============================================================================
-
 class NextStep(BaseModel):
-    """SGR Core - Determines next reasoning step with adaptive planning"""
-
-    # Reasoning chain - step-by-step thinking process (helps stabilize model)
     reasoning_steps: Annotated[List[str], MinLen(2), MaxLen(4)] = Field(
         description="Step-by-step reasoning process leading to decision"
     )
-
-    # Reasoning and state assessment
     current_situation: str = Field(description="Current research situation analysis")
     plan_status: str = Field(description="Status of current plan execution")
-
-    # Progress tracking (IMPORTANT: Use these to avoid infinite loops)
     searches_done: int = Field(default=0, description="Number of searches completed (MAX 3-4 searches)")
     enough_data: bool = Field(default=False, description="Sufficient data for report? (True after 2-3 searches)")
-
-    # Next step planning
     remaining_steps: Annotated[List[str], MinLen(1), MaxLen(3)] = Field(description="1-3 remaining steps to complete task")
     task_completed: bool = Field(description="Is the research task finished?")
+    function: Union[Clarification, GeneratePlan, WebSearch, AdaptPlan, CreateReport, ReportCompletion] = Field(
+        description="Selected tool for the next step"
+    )
 
-    # Tool routing with clarification-first bias
-    function: Union[
-        Clarification,      # FIRST PRIORITY: When uncertain
-        GeneratePlan,       # SECOND: When request is clear
-        WebSearch,          # Core research tool
-        AdaptPlan,          # When findings conflict with plan
-        CreateReport,       # When sufficient data collected
-        ReportCompletion    # Task completion
-    ] = Field(description="""
-    DECISION PRIORITY (BIAS TOWARD CLARIFICATION):
+# =============================================================================
+# JSON SCHEMA COMPAT LAYER (Pydantic → Mistral-friendly JSON Schema)
+# =============================================================================
 
-    1. If ANY uncertainty about user request → Clarification
-    2. If no plan exists and request is clear → GeneratePlan
-    3. If need to adapt research approach → AdaptPlan
-    4. If need more information AND searches_done < 3 → WebSearch
-    5. If searches_done >= 2 OR enough_data = True → CreateReport
-    6. If report created → ReportCompletion
+UNSUPPORTED_ARRAY_KEYWORDS = {
+    "minItems", "maxItems", "uniqueItems",
+    "contains", "minContains", "maxContains",
+}
 
-    CLARIFICATION TRIGGERS:
-    - Unknown terms, acronyms, abbreviations
-    - Ambiguous requests with multiple interpretations
-    - Missing context for specialized domains
-    - Any request requiring assumptions
+def _visit(obj, fn_path_value):
+    def _inner(node, path):
+        fn_path_value(path, node)
+        if isinstance(node, dict):
+            for k, v in list(node.items()):
+                _inner(v, (*path, k))
+        elif isinstance(node, list):
+            for i, v in enumerate(list(node)):
+                _inner(v, (*path, i))
+    _inner(obj, ())
 
-    ANTI-CYCLING RULES:
-    - Max 1 clarification per session
-    - Max 3-4 searches per session
-    - Create report after 2-3 searches regardless of completeness
-    """)
+def mistral_additional_properties_false(schema: dict) -> dict:
+    def visit(node):
+        if isinstance(node, dict):
+            if node.get("type") == "object" and "additionalProperties" not in node:
+                node["additionalProperties"] = False
+            if "properties" in node and isinstance(node["properties"], dict):
+                for v in node["properties"].values():
+                    visit(v)
+            if "items" in node:
+                visit(node["items"])
+            for branch in ("oneOf", "anyOf", "allOf"):
+                if branch in node and isinstance(node[branch], list):
+                    for v in node[branch]:
+                        visit(v)
+            for key in ("$defs", "definitions"):
+                if key in node and isinstance(node[key], dict):
+                    for v in node[key].values():
+                        visit(v)
+        elif isinstance(node, list):
+            for v in node:
+                visit(v)
+        return node
+    return visit(json.loads(json.dumps(schema)))  # deep copy
+
+def mistral_anyof_to_oneof(schema: dict) -> dict:
+    sc = json.loads(json.dumps(schema))
+    def _walk(node):
+        if isinstance(node, dict):
+            if "anyOf" in node and isinstance(node["anyOf"], list) and node["anyOf"]:
+                node["oneOf"] = node.pop("anyOf")
+            for _, v in list(node.items()):
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+    _walk(sc)
+    return sc
+
+def mistral_inline_refs(schema: dict) -> Tuple[dict, int]:
+    sc = json.loads(json.dumps(schema))
+    defs = sc.get("$defs") or sc.get("definitions") or {}
+    replaced = 0
+
+    def resolve_ref(ref: str) -> Optional[dict]:
+        if ref.startswith("#/$defs/"):
+            return json.loads(json.dumps(defs.get(ref.split("/", 2)[-1])))
+        if ref.startswith("#/definitions/"):
+            return json.loads(json.dumps(defs.get(ref.split("/", 2)[-1])))
+        return None
+
+    def fn(path, node):
+        nonlocal replaced
+        if isinstance(node, dict) and "$ref" in node and isinstance(node["$ref"], str):
+            target = resolve_ref(node["$ref"])
+            if target is not None:
+                parent = sc
+                for p in path[:-1]:
+                    parent = parent[p]
+                parent[path[-1]] = target
+                replaced += 1
+
+    _visit(sc, fn)
+    return sc, replaced
+
+def mistral_remove_unsupported_keywords(schema: dict) -> Tuple[dict, List[str]]:
+    removed_paths: List[str] = []
+    sc = json.loads(json.dumps(schema))
+
+    def fn(path, node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "array":
+            for key in list(node.keys()):
+                if key in UNSUPPORTED_ARRAY_KEYWORDS:
+                    removed_paths.append(".".join(str(p) for p in path + (key,)))
+                    node.pop(key, None)
+
+    _visit(sc, fn)
+    return sc, removed_paths
+
+def build_mistral_compatible_schema(pydantic_model: type[BaseModel],
+                                    loosen_arrays: bool = True,
+                                    inline_refs: bool = True) -> Tuple[dict, dict]:
+    try:
+        raw = pydantic_model.model_json_schema()
+    except Exception:
+        raw = pydantic_model.model_json_schema(mode="serialization")
+
+    steps = []
+    s1 = mistral_additional_properties_false(raw); steps.append(("additionalProperties:false", None))
+    s1 = mistral_anyof_to_oneof(s1);           steps.append(("anyOf->oneOf", None))
+
+    if inline_refs:
+        s2, count = mistral_inline_refs(s1);    steps.append(("inline_$ref", f"{count} replaced"))
+    else:
+        s2, count = s1, 0
+
+    if loosen_arrays:
+        s3, removed = mistral_remove_unsupported_keywords(s2); steps.append(("remove_unsupported_keywords", removed))
+    else:
+        s3, removed = s2, []
+
+    debug = {"transforms": steps, "removed_paths": removed}
+    return s3, debug
 
 # =============================================================================
 # PROMPTS - System Instructions
 # =============================================================================
 
-def get_system_prompt(user_request: str) -> str:
-    """Generate system prompt with user request for language detection"""
+def guardrail_message() -> str:
+    return (
+        "FORMAT CONTRACT (STRICT):\n"
+        "- Produce a single JSON object matching the schema.\n"
+        "- Field `function` MUST be exactly one object with property `tool` equal to one of:\n"
+        "  clarification | generate_plan | web_search | adapt_plan | create_report | report_completion.\n"
+        "- Do not mix properties from different tool types.\n"
+        "- `reasoning_steps`: array of 2..4 concise strings.\n"
+        "- `remaining_steps`: array of 1..3 concise strings.\n"
+        "- For `Clarification`: `unclear_terms` 1..5, `assumptions` 2..4, `questions` 3..5 strings.\n"
+        "- Output ONLY the JSON value. No prose.\n"
+    )
 
+def get_system_prompt(user_request: str) -> str:
     return f"""
 You are an expert researcher with adaptive planning and Schema-Guided Reasoning capabilities.
 
@@ -340,129 +410,126 @@ USER REQUEST EXAMPLE: "{user_request}"
 ↑ IMPORTANT: Detect the language from this request and use THE SAME LANGUAGE for all responses, searches, and reports.
 
 CORE PRINCIPLES:
-1. CLARIFICATION FIRST: For ANY uncertainty - ask clarifying questions
-2. DO NOT make assumptions - better ask than guess wrong
-3. Adapt plan when new data conflicts with initial assumptions
-4. Search queries in SAME LANGUAGE as user request
-5. REPORT ENTIRELY in SAME LANGUAGE as user request
-6. Every fact in report MUST have inline citation [1], [2], [3] integrated into sentences
+1. CLARIFICATION FIRST on any uncertainty
+2. Do not assume — ask
+3. Adapt plan when conflicts appear
+4. Search queries in SAME language as user
+5. Report ENTIRELY in SAME language
+6. Every fact MUST have inline citation [1], [2], [3]
 
 WORKFLOW:
-0. clarification (HIGHEST PRIORITY) - when request unclear
-1. generate_plan - create research plan
-2. web_search - gather information (2-3 searches MAX)
-   - Use SPECIFIC terms and context in search queries
-   - For acronyms like "SGR", add context: "SGR Schema-Guided Reasoning"
-   - Use quotes for exact phrases: "Structured Output OpenAI"
-   - SEARCH QUERIES in SAME LANGUAGE as user request
-   - scrape_content=True for deeper analysis (fetches full page content)
-   - STOP after 2-3 searches and create report
-3. adapt_plan - adapt when conflicts found
-4. create_report - create detailed report with citations
-5. report_completion - complete task
+clarification → generate_plan → web_search (2–3) → adapt_plan → create_report → report_completion
 
-ANTI-CYCLING: Maximum 1 clarification request per session.
-
-ADAPTIVITY: Actively change plan when discovering new data.
-
-LANGUAGE ADAPTATION: Always respond and create reports in the SAME LANGUAGE as the user's request. If user writes in Russian - respond in Russian, if in English - respond in English.
-        """.strip()
+ANTI-CYCLING: max 1 clarification; max 3–4 searches before report.
+""".strip()
 
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
 
-# Initialize OpenAI client with base_url if provided
-openai_kwargs = {'api_key': CONFIG['openai_api_key']}
-if CONFIG['openai_base_url']:
-    openai_kwargs['base_url'] = CONFIG['openai_base_url']
-
-client = OpenAI(**openai_kwargs)
-tavily = TavilyClient(CONFIG['tavily_api_key'])
 console = Console()
 print = console.print
 
+# Mistral client (lazy import with friendly error)
+def create_mistral_client():
+    try:
+        from mistralai import Mistral
+    except Exception:
+        print("[red]ERROR:[/red] 'mistralai' is not installed. Run: pip install mistralai")
+        raise
+    kwargs: Dict[str, Any] = {"api_key": CONFIG['mistral_api_key']}
+    if CONFIG['mistral_base_url']:
+        kwargs["server_url"] = CONFIG['mistral_base_url']
+    return Mistral(**kwargs)
+
+mistral_client = create_mistral_client()
+tavily = TavilyClient(CONFIG['tavily_api_key'])
+
 # Simple in-memory context
-CONTEXT = {
+CONTEXT: Dict[str, Any] = {
     "plan": None,
     "searches": [],
-    "sources": {},  # url -> citation_number mapping
+    "sources": {},         # url -> {number, title, url}
     "citation_counter": 0,
-    "clarification_used": False  # Anti-cycling mechanism
+    "clarification_used": False
 }
 
 # =============================================================================
 # UTILITIES
 # =============================================================================
 
+def clean_messages_for_mistral(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """
+    Нормализация ролей под Mistral:
+    - Разрешаем ровно один начальный `system` (до первого не-system).
+    - Любой последующий `system` → `user`.
+    - Любой `tool` → `user`.
+    - Допустимые роли: system/user/assistant.
+    """
+    cleaned: List[Dict[str, str]] = []
+    seen_non_system = False
+    seen_leading_system = False
 
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+
+        # Любые tool → user
+        if role == "tool":
+            role = "user"
+
+        if role == "system":
+            if seen_non_system or seen_leading_system:
+                role = "user"
+            else:
+                seen_leading_system = True
+        else:
+            seen_non_system = True
+
+        if role not in ("system", "user", "assistant"):
+            role = "user"
+
+        cleaned.append({"role": role, "content": content})
+
+    return cleaned
 
 def add_citation(url: str, title: str = "") -> int:
-    """Add source and return citation number"""
     if url in CONTEXT["sources"]:
         return CONTEXT["sources"][url]["number"]
-
     CONTEXT["citation_counter"] += 1
-    number = CONTEXT["citation_counter"]
-
-    CONTEXT["sources"][url] = {
-        "number": number,
-        "title": title,
-        "url": url
-    }
-
-    return number
+    n = CONTEXT["citation_counter"]
+    CONTEXT["sources"][url] = {"number": n, "title": title, "url": url}
+    return n
 
 def format_sources() -> str:
-    """Format sources for report"""
     if not CONTEXT["sources"]:
         return ""
-
-    sources_text = "\n\n## Sources\n"
-
+    lines = ["\n\n## Sources\n"]
     for url, data in CONTEXT["sources"].items():
-        number = data["number"]
-        title = data["title"]
-        if title:
-            sources_text += f"- [{number}] {title} - {url}\n"
-        else:
-            sources_text += f"- [{number}] {url}\n"
-
-    return sources_text
+        n, title = data["number"], data["title"]
+        lines.append(f"- [{n}] {title + ' - ' if title else ''}{url}\n")
+    return "".join(lines)
 
 # =============================================================================
 # DISPATCH - Tool Execution
 # =============================================================================
 
 def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
-    """Execute SGR commands"""
-
     if isinstance(cmd, Clarification):
-        # Mark clarification as used to prevent cycling
         context["clarification_used"] = True
-
         print(f"\n🤔 [bold yellow]CLARIFICATION NEEDED[/bold yellow]")
         print(f"💭 Reason: {cmd.reasoning}\n")
-
         if cmd.unclear_terms:
             print(f"❓ [bold]Unclear terms:[/bold] {', '.join(cmd.unclear_terms)}")
-
         print(f"\n[bold cyan]CLARIFYING QUESTIONS:[/bold cyan]")
-        for i, question in enumerate(cmd.questions, 1):
-            print(f"   {i}. {question}")
-
+        for i, q in enumerate(cmd.questions, 1):
+            print(f"   {i}. {q}")
         if cmd.assumptions:
             print(f"\n[bold green]Possible interpretations:[/bold green]")
-            for assumption in cmd.assumptions:
-                print(f"   • {assumption}")
-
+            for a in cmd.assumptions:
+                print(f"   • {a}")
         print(f"\n[bold yellow]⏸️  Research paused - please answer questions above[/bold yellow]")
-
-        return {
-            "tool": "clarification",
-            "questions": cmd.questions,
-            "status": "waiting_for_user"
-        }
+        return {"tool": "clarification", "questions": cmd.questions, "status": "waiting_for_user"}
 
     elif isinstance(cmd, GeneratePlan):
         plan = {
@@ -471,55 +538,41 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
             "search_strategies": cmd.search_strategies,
             "created_at": datetime.now().isoformat()
         }
-
         context["plan"] = plan
-
-        print(f"📋 [bold]Research Plan Created:[/bold]")
+        print(f"📋 [bold]Research Plan Created[/bold]")
         print(f"🎯 Goal: {cmd.research_goal}")
-        print(f"📝 Steps: {len(cmd.planned_steps)}")
         for i, step in enumerate(cmd.planned_steps, 1):
             print(f"   {i}. {step}")
-
         return plan
 
     elif isinstance(cmd, WebSearch):
         print(f"🔍 [bold cyan]Search query:[/bold cyan] [white]'{cmd.query}'[/white]")
-
-        # Check if scraping should be enabled
         should_scrape = CONFIG['scraping_enabled'] and cmd.scrape_content
         if should_scrape:
-            print("📄 [dim]Scraping enabled - will fetch full content[/dim]")
+            print("📄 [dim]Scraping enabled[/dim]")
 
         try:
-            response = tavily.search(
-                query=cmd.query,
-                max_results=cmd.max_results
-            )
-
-            # Add citations and optionally scrape content
+            response = tavily.search(query=cmd.query, max_results=cmd.max_results)
             citation_numbers = []
             scraped_content = {}
 
             for i, result in enumerate(response.get('results', [])):
                 url = result.get('url', '')
                 title = result.get('title', '')
-                if url:
-                    citation_num = add_citation(url, title)
-                    citation_numbers.append(citation_num)
-
-                    # Scrape full content if enabled and within limits
-                    if should_scrape and i < CONFIG['scraping_max_pages']:
-                        print(f"   📄 Scraping [{citation_num}] {url[:50]}...")
-                        scrape_result = fetch_page_content(url)
-                        scraped_content[citation_num] = scrape_result
-
-                        # Log scraping status with different icons for YouTube
-                        if scrape_result['status'] == 'success':
-                            print(f"   ✅ [{citation_num}] {scrape_result.get('char_count', 0)} chars")
-                        elif scrape_result['status'] == 'error':
-                            print(f"   ❌ [{citation_num}] Error: {scrape_result.get('error', 'Unknown')[:50]}")
-                        else:
-                            print(f"   ⚠️ [{citation_num}] Empty content")
+                if not url:
+                    continue
+                cnum = add_citation(url, title)
+                citation_numbers.append(cnum)
+                if should_scrape and i < CONFIG['scraping_max_pages']:
+                    print(f"   📄 Scraping [{cnum}] {url[:50]}...")
+                    scrape_result = fetch_page_content(url)
+                    scraped_content[cnum] = scrape_result
+                    if scrape_result['status'] == 'success':
+                        print(f"   ✅ [{cnum}] {scrape_result.get('char_count', 0)} chars")
+                    elif scrape_result['status'] == 'error':
+                        print(f"   ❌ [{cnum}] Error: {scrape_result.get('error', 'Unknown')[:50]}")
+                    else:
+                        print(f"   ⚠️ [{cnum}] Empty content")
 
             search_result = {
                 "query": cmd.query,
@@ -530,23 +583,21 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
                 "scraping_enabled": should_scrape,
                 "timestamp": datetime.now().isoformat()
             }
-
             context["searches"].append(search_result)
 
             print(f"🔍 Found {len(citation_numbers)} sources")
-            for i, (result, citation_num) in enumerate(zip(response.get('results', [])[:5], citation_numbers), 1):
-                print(f"   {i}. [{citation_num}] {result.get('url', '')}")
-
+            for i, (result, cnum) in enumerate(zip(response.get('results', [])[:5], citation_numbers), 1):
+                print(f"   {i}. [{cnum}] {result.get('url', '')}")
             if should_scrape:
-                successful_scrapes = len([c for c in scraped_content.values() if c['status'] == 'success'])
-                print(f"📄 Scraped: {successful_scrapes}/{len(scraped_content)} pages")
+                ok = len([c for c in scraped_content.values() if c['status'] == 'success'])
+                print(f"📄 Scraped: {ok}/{len(scraped_content)} pages")
 
             return search_result
 
         except Exception as e:
-            error_msg = f"Search error: {str(e)}"
-            print(f"❌ {error_msg}")
-            return {"error": error_msg}
+            msg = f"Search error: {str(e)}"
+            print(f"❌ {msg}")
+            return {"error": msg}
 
     elif isinstance(cmd, AdaptPlan):
         if context.get("plan"):
@@ -555,44 +606,32 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
             context["plan"]["adapted"] = True
             context["plan"]["adaptations"] = context["plan"].get("adaptations", []) + [cmd.plan_changes]
 
-        print(f"\n🔄 [bold yellow]PLAN ADAPTED![/bold yellow]")
+        print(f"\n🔄 [bold yellow]PLAN ADAPTED[/bold yellow]")
         print(f"📝 [bold]Changes:[/bold]")
         for change in cmd.plan_changes:
             print(f"   • [yellow]{change}[/yellow]")
         print(f"🎯 [bold green]New goal:[/bold green] {cmd.new_goal}")
-
-        return {
-            "tool": "adapt_plan",
-            "original_goal": cmd.original_goal,
-            "new_goal": cmd.new_goal,
-            "changes": cmd.plan_changes
-        }
+        return {"tool": "adapt_plan", "original_goal": cmd.original_goal, "new_goal": cmd.new_goal, "changes": cmd.plan_changes}
 
     elif isinstance(cmd, CreateReport):
-        # Debug: Log CreateReport fields
-        print(f"📝 [bold cyan]CREATE REPORT FULL DEBUG:[/bold cyan]")
+        print(f"📝 [bold cyan]CREATE REPORT[/bold cyan]")
         print(f"   🌍 Language Reference: '{cmd.user_request_language_reference}'")
         print(f"   📊 Title: '{cmd.title}'")
-        print(f"   🔍 Reasoning: '{cmd.reasoning[:150]}...'")
         print(f"   📈 Confidence: {cmd.confidence}")
-        print(f"   📄 Content Preview: '{cmd.content[:200]}...'")
-        print(f"   🌐 Content Language Detected: {'Russian' if 'Apple' in cmd.content and ('характеристик' in cmd.content or 'цен' in cmd.content) else 'English'}")
 
-        # Save report
         os.makedirs(CONFIG['reports_directory'], exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_title = "".join(c for c in cmd.title if c.isalnum() or c in (' ', '-', '_'))[:50]
         filename = f"{timestamp}_{safe_title}.md"
         filepath = os.path.join(CONFIG['reports_directory'], filename)
 
-        # Format full report with sources
-        full_content = f"# {cmd.title}\n\n"
-        full_content += f"*Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
-        full_content += cmd.content
-        full_content += format_sources()
+        full = f"# {cmd.title}\n\n"
+        full += f"*Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n"
+        full += cmd.content
+        full += format_sources()
 
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(full_content)
+            f.write(full)
 
         report = {
             "title": cmd.title,
@@ -603,203 +642,156 @@ def dispatch(cmd: BaseModel, context: Dict[str, Any]) -> Any:
             "filepath": filepath,
             "timestamp": datetime.now().isoformat()
         }
-
-        print(f"📄 [bold blue]Report Created:[/bold blue] {cmd.title}")
-        print(f"📊 Words: {report['word_count']}, Sources: {report['sources_count']}")
-        print(f"💾 Saved: {filepath}")
-        print(f"📈 Confidence: {cmd.confidence}")
-
+        print(f"📄 [bold blue]Report Saved:[/bold blue] {filepath}")
         return report
 
     elif isinstance(cmd, ReportCompletion):
         print(f"\n✅ [bold green]RESEARCH COMPLETED[/bold green]")
         print(f"📋 Status: {cmd.status}")
-
         if cmd.completed_steps:
             print(f"📝 [bold]Completed steps:[/bold]")
             for step in cmd.completed_steps:
                 print(f"   • {step}")
-
-        return {
-            "tool": "report_completion",
-            "status": cmd.status,
-            "completed_steps": cmd.completed_steps
-        }
+        return {"tool": "report_completion", "status": cmd.status, "completed_steps": cmd.completed_steps}
 
     else:
         return f"Unknown command: {type(cmd)}"
+
+# =============================================================================
+# MISTRAL JSON-SCHEMA CALL
+# =============================================================================
+
+# Build compatible schema once
+NEXTSTEP_JSON_SCHEMA, _SCHEMA_DEBUG = build_mistral_compatible_schema(
+    NextStep, loosen_arrays=True, inline_refs=True
+)
+
+def mistral_complete_json_schema(messages: List[Dict[str, Any]]) -> NextStep:
+    """Call Mistral with JSON-Schema response_format and validate via Pydantic."""
+    rf = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "nextstep",
+            "schema": NEXTSTEP_JSON_SCHEMA,
+            "strict": True,
+        },
+    }
+    cleaned = clean_messages_for_mistral(messages)
+    resp = mistral_client.chat.complete(
+        model=CONFIG['mistral_model'],
+        messages=cleaned,
+        response_format=rf,
+        max_tokens=CONFIG['max_tokens'],
+        temperature=CONFIG['temperature'],
+    )
+    raw = resp.choices[0].message.content or ""
+    return NextStep.model_validate_json(raw)
 
 # =============================================================================
 # MAIN EXECUTION ENGINE
 # =============================================================================
 
 def execute_research_task(task: str) -> str:
-    """Execute research task using SGR"""
-
+    """Execute research task using SGR with Mistral JSON-Schema only."""
     print(Panel(task, title="🔍 Research Task", title_align="left"))
-
-    # Use universal system prompt with user request for language detection
     system_prompt = get_system_prompt(task)
 
     print(f"\n[bold green]🚀 SGR RESEARCH STARTED[/bold green]")
-    print(f"[dim]🤖 Model: {CONFIG['openai_model']}[/dim]")
-    print(f"[dim]🔗 Base URL: {CONFIG['openai_base_url'] or 'default'}[/dim]")
-    print(f"[dim]🔑 API Key: {'✓ Configured' if CONFIG['openai_api_key'] else '✗ Missing'}[/dim]")
+    print(f"[dim]🤖 Provider: Mistral[/dim]")
+    print(f"[dim]🧩 Model: {CONFIG['mistral_model']}[/dim]")
+    print(f"[dim]🔗 Base URL: {CONFIG['mistral_base_url'] or 'default'}[/dim]")
+    print(f"[dim]🔑 API Key: {'✓ Configured' if CONFIG['mistral_api_key'] else '✗ Missing'}[/dim]")
     print(f"[dim]📊 Max tokens: {CONFIG['max_tokens']}, Temperature: {CONFIG['temperature']}[/dim]")
 
-    # Initialize conversation log
-    log = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": task}
+    # Ровно один начальный system: guardrails + system_prompt
+    log: List[Dict[str, Any]] = [
+        {"role": "system", "content": guardrail_message() + "\n\n" + system_prompt},
+        {"role": "user",   "content": task},
     ]
 
-    # Execute reasoning steps
     for i in range(CONFIG['max_execution_steps']):
         step_id = f"step_{i+1}"
         print(f"\n🧠 {step_id}: Planning next action...")
 
-        # Add context about clarification usage and available sources
-        context_msg = ""
+        # Context injection (как user, не system!)
+        context_msg = []
         if CONTEXT["clarification_used"]:
-            context_msg = "IMPORTANT: Clarification already used. Do not request clarification again - proceed with available information."
-
-        # Add original user request for language reference and search count
+            context_msg.append("IMPORTANT: Clarification already used. Do not request clarification again.")
         searches_count = len(CONTEXT.get("searches", []))
-        user_request_info = f"\nORIGINAL USER REQUEST: '{task}'\n(Use this for language consistency in reports)"
-        search_count_info = f"\nSEARCHES COMPLETED: {searches_count} (MAX 3-4 searches before creating report)"
-        context_msg = context_msg + "\n" + user_request_info + search_count_info if context_msg else user_request_info + search_count_info
+        context_msg.append(f"ORIGINAL USER REQUEST: '{task}'")
+        context_msg.append(f"SEARCHES COMPLETED: {searches_count} (MAX 3-4 before creating report)")
 
-        # Add available sources information
         if CONTEXT["sources"]:
-            sources_info = "\nAVAILABLE SOURCES FOR CITATIONS:\n"
+            sources_info = ["AVAILABLE SOURCES FOR CITATIONS:"]
             for url, data in CONTEXT["sources"].items():
-                number = data["number"]
-                title = data["title"] or "Untitled"
-                sources_info += f"[{number}] {title} - {url}\n"
-            sources_info += "\nUSE THESE EXACT NUMBERS [1], [2], [3] etc. in your report citations."
-            context_msg = context_msg + "\n" + sources_info if context_msg else sources_info
+                number = data["number"]; title = data["title"] or "Untitled"
+                sources_info.append(f"[{number}] {title} - {url}")
+            sources_info.append("USE THESE EXACT NUMBERS [1], [2], [3] in your report.")
+            context_msg.extend(sources_info)
 
         if context_msg:
-            log.append({"role": "system", "content": context_msg})
-            # Debug: Show context being sent
-            print(f"[dim]🔧 Context: {context_msg[:150]}...[/dim]")
+            ctx = "\n".join(context_msg)
+            log.append({"role": "user", "content": ctx})  # ВАЖНО: user, не system
+            print(f"[dim]🔧 Context: {ctx[:150]}...[/dim]")
 
         try:
-            completion = client.beta.chat.completions.parse(
-                model=CONFIG['openai_model'],
-                response_format=NextStep,
-                messages=log,
-                max_tokens=CONFIG['max_tokens'],
-                temperature=CONFIG['temperature']
-            )
-
-            job = completion.choices[0].message.parsed
-
-            if job is None:
-                print("[bold red]❌ Failed to parse LLM response[/bold red]")
-                break
-
-            # Debug: Log ALL NextStep fields
-            print(f"🤖 [bold magenta]LLM RESPONSE DEBUG:[/bold magenta]")
+            job = mistral_complete_json_schema(log)
+            # Debug
+            print(f"🤖 [bold magenta]LLM RESPONSE[/bold magenta]")
             print(f"   🧠 Reasoning Steps: {job.reasoning_steps}")
-            print(f"   📊 Current Situation: '{job.current_situation[:100]}...'")
-            print(f"   📋 Plan Status: '{job.plan_status[:100]}...'")
-            print(f"   🔍 Searches Done: {job.searches_done}")
-            print(f"   ✅ Enough Data: {job.enough_data}")
-            print(f"   📝 Remaining Steps: {job.remaining_steps}")
-            print(f"   🏁 Task Completed: {job.task_completed}")
+            print(f"   🔍 Searches Done: {job.searches_done}  ✅ Enough Data: {job.enough_data}")
+            print(f"   📝 Remaining Steps: {job.remaining_steps}  🏁 Task Completed: {job.task_completed}")
             print(f"   🔧 Tool: {job.function.tool}")
-
         except Exception as e:
-            print(f"[bold red]❌ LLM request error: {str(e)}[/bold red]")
+            print(f"[bold red]❌ Mistral/Validation error:[/bold red] {e}")
             break
 
-        # Check for task completion
+        # Ранний выход на Clarification, чтобы REPL спросил пользователя
+        if isinstance(job.function, Clarification):
+            dispatch(job.function, CONTEXT)
+            return "CLARIFICATION_NEEDED"
+
         if job.task_completed or isinstance(job.function, ReportCompletion):
             print(f"[bold green]✅ Task completed[/bold green]")
             dispatch(job.function, CONTEXT)
             break
 
-        # Check for clarification cycling
-        if isinstance(job.function, Clarification) and CONTEXT["clarification_used"]:
-            print(f"[bold red]❌ Clarification cycling detected - forcing continuation[/bold red]")
-            log.append({
-                "role": "user",
-                "content": "ANTI-CYCLING: Clarification already used. Continue with generate_plan based on available information."
-            })
-            continue
-
-        # Display current step
-        next_step = job.remaining_steps[0] if job.remaining_steps else "Completing"
-        print(f"[blue]{next_step}[/blue]")
-        print(f"[dim]💭 Reasoning: {job.function.reasoning[:100]}...[/dim]")
-        print(f"  Tool: {job.function.tool}")
-
-        # Handle clarification specially
-        if isinstance(job.function, Clarification):
-            result = dispatch(job.function, CONTEXT)
-            return "CLARIFICATION_NEEDED"
-
-        # Add to conversation log
-        log.append({
-            "role": "assistant",
-            "content": next_step,
-            "tool_calls": [{
-                "type": "function",
-                "id": step_id,
-                "function": {
-                    "name": job.function.tool,
-                    "arguments": job.function.model_dump_json()
-                }
-            }]
-        })
+        # assistant сводка шага
+        next_step_text = job.remaining_steps[0] if job.remaining_steps else "Completing"
+        print(f"[blue]{next_step_text}[/blue]")
+        log.append({"role": "assistant", "content": next_step_text})
 
         # Execute tool
         result = dispatch(job.function, CONTEXT)
 
-        # Add result to log - format search results better
+        # Feed back tool result как user
         if isinstance(job.function, WebSearch) and isinstance(result, dict):
-            # Format search results for better LLM understanding
-            formatted_result = f"Search Query: {result.get('query', '')}\n\n"
-
-            # Include answer only if it exists (with include_answer=True)
+            formatted = f"Search Query: {result.get('query','')}\n\n"
             if result.get('answer'):
-                formatted_result += f"AI Answer: {result.get('answer')}\n\n"
-
-            formatted_result += "Search Results:\n"
-            scraped_content = result.get('scraped_content', {})
-
-            for i, source_result in enumerate(result.get('results', [])[:5], 1):
-                citation_num = result.get('citation_numbers', [])[i-1] if i-1 < len(result.get('citation_numbers', [])) else i
-                title = source_result.get('title', 'Untitled')
-                url = source_result.get('url', '')
-
-                # Use scraped content if available, otherwise fallback to snippet
-                if citation_num in scraped_content and scraped_content[citation_num]['status'] == 'success':
-                    full_content = scraped_content[citation_num]['full_content']
-                    # Limit content size for LLM using configurable limit
-                    content_limit = CONFIG['scraping_content_limit']
-                    content = full_content[:content_limit] + "..." if len(full_content) > content_limit else full_content
-                    formatted_result += f"[{citation_num}] {title}\n{url}\n\n**Full Content (Markdown):**\n{content}\n\n"
+                formatted += f"AI Answer: {result['answer']}\n\n"
+            formatted += "Search Results:\n"
+            scraped = result.get('scraped_content', {})
+            for i2, source in enumerate(result.get('results', [])[:5], 1):
+                cnums = result.get('citation_numbers', [])
+                cnum = cnums[i2-1] if i2-1 < len(cnums) else i2
+                title = source.get('title', 'Untitled'); url = source.get('url', '')
+                if cnum in scraped and scraped[cnum]['status'] == 'success':
+                    full = scraped[cnum]['full_content']
+                    limit = CONFIG['scraping_content_limit']
+                    content = full[:limit] + "..." if len(full) > limit else full
+                    formatted += f"[{cnum}] {title}\n{url}\n**Full Content (Markdown):**\n{content}\n\n"
                 else:
-                    # Fallback to original snippet
-                    content = source_result.get('content', '')[:300] + "..." if source_result.get('content', '') else ""
-                    formatted_result += f"[{citation_num}] {title}\n{url}\n{content}\n\n"
-
-            # Add scraping summary if enabled
+                    snip = source.get('content', '')[:300]
+                    formatted += f"[{cnum}] {title}\n{url}\n{snip}\n\n"
             if result.get('scraping_enabled'):
-                successful_scrapes = len([c for c in scraped_content.values() if c['status'] == 'success'])
-                formatted_result += f"Scraping Summary: {successful_scrapes}/{len(scraped_content)} pages successfully scraped\n"
-
-            result_text = formatted_result
+                ok = len([c for c in scraped.values() if c['status'] == 'success'])
+                formatted += f"Scraping Summary: {ok}/{len(scraped)} pages successfully scraped\n"
+            log.append({"role": "user", "content": formatted})
         else:
             result_text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            log.append({"role": "user", "content": f"TOOL RESULT ({job.function.tool}): {result_text}"})
 
-        log.append({"role": "tool", "content": result_text, "tool_call_id": step_id})
-
-        print(f"  Result: {result_text[:100]}..." if len(result_text) > 100 else f"  Result: {result_text}")
-
-        # Auto-complete after report creation
+        # Автозавершение после отчёта
         if isinstance(job.function, CreateReport):
             print(f"\n✅ [bold green]Auto-completing after report creation[/bold green]")
             break
@@ -811,9 +803,8 @@ def execute_research_task(task: str) -> str:
 # =============================================================================
 
 def main():
-    """Main application interface"""
-    print("[bold]🧠 SGR Research Agent - Adaptive Planning & Clarification[/bold]")
-    print("Schema-Guided Reasoning with plan adaptation capabilities")
+    print("[bold]🧠 SGR Research Agent (Mistral, JSON-Schema only)[/bold]")
+    print("Schema-Guided Reasoning with plan adaptation and strict JSON Schema I/O")
     print()
     print("Core features:")
     print("  🤔 Clarification-first approach")
@@ -831,14 +822,9 @@ def main():
             if awaiting_clarification:
                 response = input("💬 Your clarification response (or 'quit'): ").strip()
                 awaiting_clarification = False
-
                 if response.lower() in ['quit', 'exit']:
                     break
-
-                # Combine original task with clarification
                 task = f"Original request: '{original_task}'\nClarification: {response}\n\nProceed with research based on clarification."
-
-                # Reset clarification flag for new combined task
                 CONTEXT["clarification_used"] = False
             else:
                 task = input("🔍 Enter research task (or 'quit'): ").strip()
@@ -846,12 +832,10 @@ def main():
             if task.lower() in ['quit', 'exit']:
                 print("👋 Goodbye!")
                 break
-
             if not task:
                 print("❌ Empty task. Try again.")
                 continue
 
-            # Reset context for new task (except during clarification)
             if not awaiting_clarification:
                 CONTEXT.clear()
                 CONTEXT.update({
@@ -864,12 +848,10 @@ def main():
                 original_task = task
 
             result = execute_research_task(task)
-
             if result == "CLARIFICATION_NEEDED":
                 awaiting_clarification = True
                 continue
 
-            # Show statistics
             searches_count = len(CONTEXT.get("searches", []))
             sources_count = len(CONTEXT.get("sources", {}))
             print(f"\n📊 Session stats: 🔍 {searches_count} searches, 📎 {sources_count} sources")
